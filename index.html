@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <title>羽球排程即時看板</title>
+  <!-- 手機最佳化設定 -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  
+  <!-- 標準預編譯 Tailwind CSS -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.css">
+  
+  <!-- Firebase 官方 SDK -->
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
+  
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <style>
+    .court-net {
+      position: absolute;
+      top: 0; bottom: 0; left: 50%;
+      margin-left: -1px;
+      width: 2px;
+      background: rgba(255, 255, 255, 0.4);
+      border-right: 1px dashed rgba(255, 255, 255, 0.7);
+    }
+  </style>
+</head>
+<body class="bg-gray-100 text-gray-800 font-sans min-h-screen pb-12">
+
+  <!-- 頂部導覽列 -->
+  <header class="bg-green-600 text-white shadow-md sticky top-0 z-40">
+    <div class="max-w-4xl mx-auto px-4 py-3 flex justify-between items-center">
+      <div class="flex items-center space-x-2">
+        <i class="fa-solid fa-feather text-xl"></i>
+        <h1 class="font-bold text-lg tracking-wide">羽球對戰即時看板</h1>
+      </div>
+      <div class="flex items-center space-x-2">
+        <span id="sync-badge" class="text-xs bg-green-700 px-2 py-1 rounded-full border border-green-400 flex items-center space-x-1">
+          <span class="w-2 h-2 rounded-full bg-green-300"></span>
+          <span>連線中</span>
+        </span>
+        <button onclick="copyShareLink()" class="bg-green-700 hover:bg-green-800 text-xs px-2.5 py-1.5 rounded-lg flex items-center space-x-1 font-medium shadow-sm transition">
+          <i class="fa-solid fa-share-nodes"></i>
+          <span>分享</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-4xl mx-auto px-4 mt-4 space-y-5">
+
+    <!-- 當前對戰卡片 -->
+    <section class="bg-white rounded-2xl shadow-sm border border-gray-200 overflow-hidden">
+      <div class="bg-gray-50 border-b border-gray-200 px-4 py-3 flex justify-between items-center">
+        <div class="flex items-center space-x-2">
+          <span class="w-2.5 h-2.5 rounded-full bg-green-500"></span>
+          <h2 class="font-bold text-gray-700 text-base">目前賽況</h2>
+          <span id="match-status-tag" class="text-xs font-semibold px-2 py-0.5 rounded-full bg-gray-200 text-gray-600">無進行中賽事</span>
+        </div>
+        <div id="match-actions" class="flex space-x-2"></div>
+      </div>
+
+      <div class="p-5">
+        <div id="court-view" style="display: none;">
+          <div class="bg-green-800 rounded-xl p-4 text-white relative shadow-inner">
+            <div class="grid grid-cols-2 gap-4 relative">
+              <div class="court-net"></div>
+
+              <div class="bg-green-900 bg-opacity-60 p-3 rounded-lg flex flex-col items-center justify-center min-h-24 border border-green-700">
+                <div class="text-xs text-green-300 font-semibold mb-1">組合 A</div>
+                <div id="team-a-display" class="text-lg md:text-xl font-black tracking-wide text-center"></div>
+              </div>
+
+              <div class="bg-green-900 bg-opacity-60 p-3 rounded-lg flex flex-col items-center justify-center min-h-24 border border-green-700">
+                <div class="text-xs text-green-300 font-semibold mb-1">組合 B</div>
+                <div id="team-b-display" class="text-lg md:text-xl font-black tracking-wide text-center"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="mt-3 flex items-center space-x-2 text-xs text-gray-500 bg-gray-50 p-2.5 rounded-lg border border-gray-200">
+            <i class="fa-solid fa-mug-hot text-yellow-500"></i>
+            <span class="font-bold">本場輪休：</span>
+            <span id="resting-players" class="text-gray-700 font-medium">無</span>
+          </div>
+        </div>
+
+        <div id="empty-court" class="py-10 text-center">
+          <i class="fa-solid fa-people-arrows text-3xl text-gray-300 mb-2"></i>
+          <p class="text-gray-500 text-sm font-medium">尚未安排比賽，點擊下方「排定下一場」開始</p>
+        </div>
+
+        <button onclick="scheduleNextMatch()" class="mt-4 w-full bg-green-600 hover:bg-green-700 text-white py-3 rounded-xl font-bold flex items-center justify-center space-x-2 shadow-sm transition">
+          <i class="fa-solid fa-dice"></i>
+          <span>智慧排下一場（公平輪休）</span>
+        </button>
+      </div>
+    </section>
+
+    <!-- 球員名冊管理（輸入框常駐置頂、可靠收合） -->
+    <section class="bg-white rounded-2xl shadow-sm border border-gray-200 p-5">
+      <div class="flex justify-between items-center mb-3">
+        <div>
+          <h2 class="font-bold text-gray-800 text-base">球員名冊與出勤管理</h2>
+          <p class="text-xs text-gray-400">輸入框一行代表一個人，修改後點擊儲存名冊即可生效</p>
+        </div>
+        <button onclick="toggleRosterEdit()" id="btn-edit-roster" class="text-xs bg-gray-100 hover:bg-gray-200 text-gray-600 px-3 py-1.5 rounded-lg font-medium transition flex items-center space-x-1">
+          <i class="fa-solid fa-chevron-up" id="toggle-icon"></i>
+          <span id="toggle-text">收合輸入框</span>
+        </button>
+      </div>
+
+      <!-- 名單輸入框（初始無任何預設名單） -->
+      <div id="roster-editor" style="display: block;" class="mb-4 p-3 bg-gray-50 rounded-xl border border-gray-200">
+        <label class="block text-xs font-semibold text-gray-500 mb-1">球員名單（一行一位）：</label>
+        <textarea id="roster-textarea" rows="5" placeholder="請在此輸入名單，一行一人&#10;王小明&#10;李小美&#10;陳大華&#10;張志豪" class="w-full text-sm font-medium p-2.5 border border-gray-300 rounded-lg focus:outline-none focus:border-green-500 bg-white"></textarea>
+        <div class="mt-2 flex justify-between items-center">
+          <span class="text-xs text-gray-400">儲存後既有出賽次數將自動保留</span>
+          <button onclick="saveRosterFromText()" class="text-xs px-4 py-1.5 rounded-lg bg-green-600 text-white font-semibold hover:bg-green-700 shadow-sm transition">
+            <i class="fa-solid fa-check mr-1"></i>儲存名冊
+          </button>
+        </div>
+      </div>
+
+      <!-- 球員統計與狀態清單 -->
+      <div class="overflow-x-auto">
+        <table class="w-full text-left text-sm">
+          <thead>
+            <tr class="text-xs text-gray-400 border-b border-gray-100 pb-2">
+              <th class="py-2 font-medium">球員</th>
+              <th class="py-2 font-medium text-center">已出賽</th>
+              <th class="py-2 font-medium text-center">連賽/連休</th>
+              <th class="py-2 font-medium text-right">出勤狀態</th>
+            </tr>
+          </thead>
+          <tbody id="player-table-body" class="divide-y divide-gray-100"></tbody>
+        </table>
+      </div>
+
+      <div class="mt-4 pt-3 border-t border-gray-100 flex justify-between items-center text-xs">
+        <span class="text-gray-400" id="total-summary">總在場人數: 0</span>
+        <button onclick="openResetModal()" class="text-red-500 hover:text-red-700 font-medium flex items-center space-x-1">
+          <i class="fa-solid fa-rotate-left"></i>
+          <span>重置所有紀錄</span>
+        </button>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- 開打前換人彈窗 -->
+  <div id="swap-modal" style="display: none;" class="fixed inset-0 bg-black bg-opacity-40 z-50 flex items-center justify-center p-4">
+    <div class="bg-white w-full max-w-sm rounded-2xl p-5 shadow-2xl">
+      <h3 class="text-base font-bold text-gray-800 mb-2">更換開打球員</h3>
+      <p class="text-xs text-gray-500 mb-4">選取場上球員與想替換的休息球員：</p>
+      
+      <div class="space-y-3">
+        <div>
+          <label class="text-xs font-semibold text-gray-500 block mb-1">被換下的場上球員：</label>
+          <select id="swap-out-select" class="w-full text-sm p-2 rounded-lg border border-gray-300"></select>
+        </div>
+        <div>
+          <label class="text-xs font-semibold text-gray-500 block mb-1">換上的休息球員：</label>
+          <select id="swap-in-select" class="w-full text-sm p-2 rounded-lg border border-gray-300"></select>
+        </div>
+      </div>
+
+      <div class="mt-5 flex justify-end space-x-2">
+        <button onclick="closeSwapModal()" class="px-3 py-1.5 text-xs font-semibold text-gray-500 bg-gray-100 rounded-lg">取消</button>
+        <button onclick="confirmSwap()" class="px-3 py-1.5 text-xs font-semibold text-white bg-green-600 rounded-lg hover:bg-green-700">確定換人</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 重置確認彈窗 -->
+  <div id="reset-modal" style="display: none;" class="fixed inset-0 bg-black bg-opacity-40 z-50 flex items-center justify-center p-4">
+    <div class="bg-white w-full max-w-xs rounded-2xl p-5 shadow-2xl text-center">
+      <i class="fa-solid fa-triangle-exclamation text-yellow-500 text-3xl mb-2"></i>
+      <h3 class="text-base font-bold text-gray-800">確定重置全部紀錄？</h3>
+      <p class="text-xs text-gray-500 mt-1 mb-4">球員名冊將保留，但所有已出賽次數與賽況將歸零。</p>
+      <div class="flex justify-center space-x-2">
+        <button onclick="closeResetModal()" class="px-4 py-1.5 text-xs font-semibold text-gray-500 bg-gray-100 rounded-lg">取消</button>
+        <button onclick="executeReset()" class="px-4 py-1.5 text-xs font-semibold text-white bg-red-600 rounded-lg hover:bg-red-700">確定重置</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const firebaseConfig = {
+      databaseURL: "https://badminton-e0324-default-rtdb.asia-southeast1.firebasedatabase.app"
+    };
+    firebase.initializeApp(firebaseConfig);
+    const db = firebase.database();
+
+    const roomId = window.location.hash.replace('#', '') || 'main-court';
+    const roomRef = db.ref('rooms/' + roomId);
+
+    let state = {
+      players: [],
+      currentMatch: null
+    };
+
+    // 監聽雲端資料同步
+    roomRef.on('value', (snapshot) => {
+      const data = snapshot.val();
+      if (data) {
+        state.players = data.players || [];
+        state.currentMatch = data.currentMatch || null;
+      } else {
+        syncToFirebase();
+      }
+      render();
+      syncTextareaWithState();
+      document.getElementById('sync-badge').innerHTML = '<span class="w-2 h-2 rounded-full bg-green-300"></span> <span>即時同步中</span>';
+    });
+
+    function syncToFirebase() {
+      roomRef.set(state);
+    }
+
+    function syncTextareaWithState() {
+      const textarea = document.getElementById('roster-textarea');
+      if (document.activeElement !== textarea) {
+        textarea.value = (state.players || []).map(p => p.name).join('\n');
+      }
+    }
+
+    // 智慧排程演算法
+    function scheduleNextMatch() {
+      const activePlayers = (state.players || []).filter(p => p.status === 'active');
+      if (activePlayers.length < 4) {
+        alert('在場人數不足 4 人，無法安排雙打比賽！請先在名冊中新增成員並設為「在場」。');
+        return;
+      }
+
+      const scored = [...activePlayers].map(p => {
+        let score = (p.played || 0) * 10;
+        if ((p.consecutivePlay || 0) >= 1) {
+          score += (activePlayers.length === 6 ? 100 : 25 * p.consecutivePlay);
+        }
+        if ((p.consecutiveRest || 0) > 0) {
+          score -= (p.consecutiveRest * 15);
+        }
+        score += (Math.random() * 2);
+        return { player: p, score };
+      });
+
+      scored.sort((a, b) => a.score - b.score);
+      const chosen = scored.slice(0, 4).map(s => s.player);
+
+      chosen.sort(() => Math.random() - 0.5);
+
+      state.currentMatch = {
+        teamA: [chosen[0].id, chosen[1].id],
+        teamB: [chosen[2].id, chosen[3].id],
+        status: 'ready'
+      };
+
+      syncToFirebase();
+    }
+
+    function startMatch() {
+      if (!state.currentMatch) return;
+      state.currentMatch.status = 'playing';
+      syncToFirebase();
+    }
+
+    function finishMatch() {
+      if (!state.currentMatch) return;
+      const currentIds = [...state.currentMatch.teamA, ...state.currentMatch.teamB];
+
+      state.players.forEach(p => {
+        if (currentIds.includes(p.id)) {
+          p.played = (p.played || 0) + 1;
+          p.consecutivePlay = (p.consecutivePlay || 0) + 1;
+          p.consecutiveRest = 0;
+        } else if (p.status === 'active') {
+          p.consecutivePlay = 0;
+          p.consecutiveRest = (p.consecutiveRest || 0) + 1;
+        }
+      });
+
+      state.currentMatch = null;
+      syncToFirebase();
+    }
+
+    // 開打前換人
+    function openSwapModal() {
+      if (!state.currentMatch) return;
+      const currentIds = [...state.currentMatch.teamA, ...state.currentMatch.teamB];
+      const onCourt = state.players.filter(p => currentIds.includes(p.id));
+      const onBench = state.players.filter(p => !currentIds.includes(p.id) && p.status === 'active');
+
+      if (onBench.length === 0) {
+        alert('目前場下沒有其他在場球員可供替換！');
+        return;
+      }
+
+      const outSelect = document.getElementById('swap-out-select');
+      const inSelect = document.getElementById('swap-in-select');
+      outSelect.innerHTML = onCourt.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
+      inSelect.innerHTML = onBench.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
+
+      document.getElementById('swap-modal').style.display = 'flex';
+    }
+
+    function closeSwapModal() {
+      document.getElementById('swap-modal').style.display = 'none';
+    }
+
+    function confirmSwap() {
+      const outId = document.getElementById('swap-out-select').value;
+      const inId = document.getElementById('swap-in-select').value;
+
+      let { teamA, teamB } = state.currentMatch;
+      if (teamA.includes(outId)) {
+        teamA = teamA.map(id => id === outId ? inId : id);
+      } else {
+        teamB = teamB.map(id => id === outId ? inId : id);
+      }
+      state.currentMatch.teamA = teamA;
+      state.currentMatch.teamB = teamB;
+
+      closeSwapModal();
+      syncToFirebase();
+    }
+
+    // 修正：確實切換 display 樣式，確保收合與展開都能 100% 正常反應
+    function toggleRosterEdit() {
+      const box = document.getElementById('roster-editor');
+      const text = document.getElementById('toggle-text');
+      const icon = document.getElementById('toggle-icon');
+      
+      const isHidden = box.style.display === 'none';
+      if (isHidden) {
+        box.style.display = 'block';
+        text.textContent = '收合輸入框';
+        icon.className = 'fa-solid fa-chevron-up';
+      } else {
+        box.style.display = 'none';
+        text.textContent = '展開輸入框';
+        icon.className = 'fa-solid fa-chevron-down';
+      }
+    }
+
+    function saveRosterFromText() {
+      const lines = document.getElementById('roster-textarea').value
+        .split('\n')
+        .map(s => s.trim())
+        .filter(s => s.length > 0);
+
+      const existingPlayers = state.players || [];
+      const newPlayers = lines.map(name => {
+        const exist = existingPlayers.find(p => p.name === name);
+        if (exist) return exist;
+        return {
+          id: '_' + Math.random().toString(36).substr(2, 9),
+          name: name,
+          status: 'active',
+          played: 0,
+          consecutivePlay: 0,
+          consecutiveRest: 0
+        };
+      });
+
+      state.players = newPlayers;
+      syncToFirebase();
+    }
+
+    function changePlayerStatus(id, newStatus) {
+      const p = (state.players || []).find(x => x.id === id);
+      if (p) {
+        p.status = newStatus;
+        syncToFirebase();
+      }
+    }
+
+    // 重置紀錄
+    function openResetModal() { document.getElementById('reset-modal').style.display = 'flex'; }
+    function closeResetModal() { document.getElementById('reset-modal').style.display = 'none'; }
+    function executeReset() {
+      (state.players || []).forEach(p => {
+        p.played = 0;
+        p.consecutivePlay = 0;
+        p.consecutiveRest = 0;
+      });
+      state.currentMatch = null;
+      closeResetModal();
+      syncToFirebase();
+    }
+
+    // 渲染畫面
+    function render() {
+      const courtView = document.getElementById('court-view');
+      const emptyCourt = document.getElementById('empty-court');
+      const actionsDiv = document.getElementById('match-actions');
+      const tag = document.getElementById('match-status-tag');
+      const players = state.players || [];
+
+      if (!state.currentMatch) {
+        courtView.style.display = 'none';
+        emptyCourt.style.display = 'block';
+        tag.textContent = '閒置中';
+        tag.className = 'text-xs font-semibold px-2 py-0.5 rounded-full bg-gray-100 text-gray-500';
+        actionsDiv.innerHTML = '';
+      } else {
+        courtView.style.display = 'block';
+        emptyCourt.style.display = 'none';
+
+        const getName = id => (players.find(p => p.id === id) || {}).name || '未知';
+        document.getElementById('team-a-display').textContent = `${getName(state.currentMatch.teamA[0])}  &  ${getName(state.currentMatch.teamA[1])}`;
+        document.getElementById('team-b-display').textContent = `${getName(state.currentMatch.teamB[0])}  &  ${getName(state.currentMatch.teamB[1])}`;
+
+        const playingIds = [...state.currentMatch.teamA, ...state.currentMatch.teamB];
+        const resting = players.filter(p => p.status === 'active' && !playingIds.includes(p.id));
+        document.getElementById('resting-players').textContent = resting.length > 0 ? resting.map(p => p.name).join('、') : '無人輪休';
+
+        if (state.currentMatch.status === 'ready') {
+          tag.textContent = '待開打 (確認名單)';
+          tag.className = 'text-xs font-semibold px-2 py-0.5 rounded-full bg-yellow-100 text-yellow-800';
+          actionsDiv.innerHTML = `
+            <button onclick="openSwapModal()" class="text-xs bg-gray-200 hover:bg-gray-300 text-gray-700 font-bold px-3 py-1.5 rounded-lg transition">替換球員</button>
+            <button onclick="startMatch()" class="text-xs bg-green-600 hover:bg-green-700 text-white font-bold px-3 py-1.5 rounded-lg transition shadow-sm">正式開打</button>
+          `;
+        } else {
+          tag.textContent = '比賽進行中';
+          tag.className = 'text-xs font-semibold px-2 py-0.5 rounded-full bg-green-100 text-green-700 animate-pulse';
+          actionsDiv.innerHTML = `
+            <button onclick="finishMatch()" class="text-xs bg-green-600 hover:bg-green-700 text-white font-bold px-3 py-1.5 rounded-lg transition shadow-sm">完成本場比賽</button>
+          `;
+        }
+      }
+
+      // 渲染名冊表格
+      const tbody = document.getElementById('player-table-body');
+      if (players.length === 0) {
+        tbody.innerHTML = `
+          <tr>
+            <td colspan="4" class="py-6 text-center text-gray-400 text-xs">
+              尚無球員，請在上方輸入框輸入名單（一行一人），點擊「儲存名冊」即可建立。
+            </td>
+          </tr>
+        `;
+      } else {
+        tbody.innerHTML = players.map(p => {
+          const selectColorClass = p.status === 'active' 
+            ? 'bg-green-50 text-green-700 border-green-200' 
+            : (p.status === 'late' ? 'bg-yellow-50 text-yellow-700 border-yellow-200' : 'bg-gray-100 text-gray-600 border-gray-300');
+
+          const statusSelect = `
+            <select onchange="changePlayerStatus('${p.id}', this.value)" class="text-xs font-bold px-2 py-1 rounded-lg border focus:outline-none ${selectColorClass}">
+              <option value="active" ${p.status === 'active' ? 'selected' : ''}>🟢 在場</option>
+              <option value="late" ${p.status === 'late' ? 'selected' : ''}>🟡 遲到/未到</option>
+              <option value="left" ${p.status === 'left' ? 'selected' : ''}>⚪ 早退</option>
+            </select>
+          `;
+
+          return `
+            <tr class="hover:bg-gray-50 transition">
+              <td class="py-2.5 font-bold text-gray-800">${p.name}</td>
+              <td class="py-2.5 text-center font-bold text-green-600">${p.played || 0}</td>
+              <td class="py-2.5 text-center text-xs text-gray-500">
+                ${(p.consecutivePlay || 0) > 0 ? `<span class="text-yellow-600 font-semibold">連打 ${p.consecutivePlay}</span>` : `連休 ${p.consecutiveRest || 0}`}
+              </td>
+              <td class="py-2.5 text-right">${statusSelect}</td>
+            </tr>
+          `;
+        }).join('');
+      }
+
+      const activeCount = players.filter(p => p.status === 'active').length;
+      document.getElementById('total-summary').textContent = `在場球員: ${activeCount} 人 / 總球員: ${players.length} 人`;
+    }
+
+    function copyShareLink() {
+      navigator.clipboard.writeText(window.location.href).then(() => {
+        alert('已複製此看板網址！直接貼到 LINE 群組，大家點開就能看到即時排程。');
+      });
+    }
+  </script>
+</body>
+</html>
