@@ -211,17 +211,19 @@
   <!-- 換人彈窗 -->
   <div id="swap-modal" style="display: none;" class="fixed inset-0 bg-black bg-opacity-40 z-50 flex items-center justify-center p-4">
     <div class="bg-white w-full max-w-sm rounded-2xl p-5 shadow-2xl">
-      <h3 class="text-base font-bold text-gray-800 mb-2">更換當前場上球員</h3>
-      <p class="text-xs text-gray-500 mb-4">選取體力不支或欲換下的選手，換為場下休息球員（換人不會提前結算場次）：</p>
+      <h3 class="text-base font-bold text-gray-800 mb-2">替換 / 調整場上球員</h3>
+      <p class="text-xs text-gray-500 mb-4 leading-relaxed">
+        可選擇換上<strong>場下休息</strong>球員，或直接與<strong>場上其他球員</strong>對調位置打亂搭檔（不會提前結算場次）：
+      </p>
       
       <div class="space-y-3">
         <div>
-          <label class="text-xs font-semibold text-gray-500 block mb-1">換下（目前場上）：</label>
-          <select id="swap-out-select" class="w-full text-sm p-2 rounded-lg border border-gray-300"></select>
+          <label class="text-xs font-semibold text-gray-500 block mb-1">換下 / 調整（目前場上 4 人）：</label>
+          <select id="swap-out-select" onchange="updateSwapInOptions()" class="w-full text-sm p-2 rounded-lg border border-gray-300 bg-white"></select>
         </div>
         <div>
-          <label class="text-xs font-semibold text-gray-500 block mb-1">換上（場下休息）：</label>
-          <select id="swap-in-select" class="w-full text-sm p-2 rounded-lg border border-gray-300"></select>
+          <label class="text-xs font-semibold text-gray-500 block mb-1">換上 / 對調（其餘在場球員）：</label>
+          <select id="swap-in-select" class="w-full text-sm p-2 rounded-lg border border-gray-300 bg-white"></select>
         </div>
       </div>
 
@@ -242,9 +244,7 @@
         <span class="text-red-600 font-bold">球員名冊、場上賽況與對戰紀錄</span>將全數清空。
       </p>
       <div class="flex justify-center space-x-2">
-        <!-- 確認按鈕放置於左側 -->
         <button onclick="executeEndAllMatches()" class="px-4 py-1.5 text-xs font-semibold text-white bg-green-600 hover:bg-green-700 active:bg-green-800 rounded-lg shadow-sm transition">確認全部清空</button>
-        <!-- 取消按鈕放置於右側 -->
         <button onclick="closeEndSessionModal()" class="px-4 py-1.5 text-xs font-semibold text-gray-600 bg-gray-100 hover:bg-gray-200 rounded-lg transition">取消</button>
       </div>
     </div>
@@ -267,7 +267,6 @@
       history: []
     };
 
-    // 預設為可編輯名單狀態
     let isEditingRoster = true;
 
     roomRef.on('value', (snapshot) => {
@@ -352,54 +351,113 @@
       };
     }
 
-    function pickFourPlayers(playerPool) {
-      if (playerPool.length < 4) return null;
+    function getCoPlayCount(player, currentSelected, history = []) {
+      if (!history || history.length === 0 || currentSelected.length === 0) return 0;
+      let count = 0;
+      const targetId = player.id ?? player.name;
+      const selectedIds = new Set(currentSelected.map(p => p.id ?? p.name));
 
+      for (const match of history) {
+        const playersInMatch = [
+          ...(match.teamAIds || []),
+          ...(match.teamBIds || []),
+          ...(match.teamA || []),
+          ...(match.teamB || []),
+          ...(match.players || [])
+        ].map(p => (typeof p === 'object' ? (p.id ?? p.name) : p));
+
+        if (playersInMatch.includes(targetId)) {
+          for (const sid of selectedIds) {
+            if (playersInMatch.includes(sid)) {
+              count++;
+            }
+          }
+        }
+      }
+      return count;
+    }
+
+    function pickFourPlayers(playerPool, matchHistory = state.history || []) {
       const N = playerPool.length;
-      let maxConsecutiveAllowed = 999;
-      if (N === 6) maxConsecutiveAllowed = 2;
-      else if (N === 5) maxConsecutiveAllowed = 4;
-      else if (N >= 7) maxConsecutiveAllowed = 1;
+      if (N < 4) return null;
+      if (N === 4) return divideIntoBestTeams(playerPool);
 
-      const selected = [];
-      const selectedIds = new Set();
+      let maxConsecutivePlay = 2;
+      if (N === 5) maxConsecutivePlay = 4;
+      else if (N >= 9) maxConsecutivePlay = 1;
 
-      const restingPlayers = playerPool
-        .filter(p => (p.consecutiveRest || 0) > 0)
-        .sort((a, b) => (b.consecutiveRest || 0) - (a.consecutiveRest || 0));
+      const shuffledPool = [...playerPool].sort(() => Math.random() - 0.5);
 
-      for (const p of restingPlayers) {
-        if (selected.length < 4) {
-          selected.push(p);
-          selectedIds.add(p.id);
+      const scoredPlayers = shuffledPool.map(p => {
+        let score = 0;
+        const played = p.played || 0;
+        const cPlay = p.consecutivePlay || 0;
+        const cRest = p.consecutiveRest || 0;
+
+        score -= played * 50;
+
+        if (cRest === 1) {
+          score += (N === 8 ? 25 : 40);
+        } else if (cRest >= 2) {
+          score += 250 + (cRest * 20);
         }
-      }
 
-      if (selected.length === 4) {
-        return divideIntoBestTeams(selected);
-      }
-
-      let candidates = playerPool.filter(p => !selectedIds.has(p.id));
-      let eligibleCandidates = candidates.filter(p => (p.consecutivePlay || 0) < maxConsecutiveAllowed);
-
-      if (selected.length + eligibleCandidates.length < 4) {
-        eligibleCandidates = candidates;
-      }
-
-      eligibleCandidates.sort((a, b) => {
-        if ((a.played || 0) !== (b.played || 0)) {
-          return (a.played || 0) - (b.played || 0);
+        if (cPlay >= maxConsecutivePlay) {
+          score -= 250;
+        } else if (cPlay === 1) {
+          score -= (N === 8 ? 15 : 25);
+        } else if (cPlay >= 2) {
+          score -= (cPlay * 20);
         }
-        if ((a.consecutivePlay || 0) !== (b.consecutivePlay || 0)) {
-          return (a.consecutivePlay || 0) - (b.consecutivePlay || 0);
-        }
-        return Math.random() - 0.5;
+
+        score += Math.random() * 12;
+
+        return { player: p, score };
       });
 
-      for (const p of eligibleCandidates) {
-        if (selected.length < 4) {
-          selected.push(p);
-          selectedIds.add(p.id);
+      scoredPlayers.sort((a, b) => b.score - a.score);
+
+      let selected = [];
+
+      if (N === 8) {
+        selected.push(scoredPlayers[0].player, scoredPlayers[1].player);
+
+        const needFreshBlood = selected.every(p => (p.consecutivePlay || 0) === 1) === false &&
+                               selected.every(p => (p.consecutiveRest || 0) === 1);
+
+        let remainingCandidates = scoredPlayers
+          .slice(2)
+          .filter(item => (item.player.consecutivePlay || 0) < maxConsecutivePlay);
+
+        for (let i = 0; i < 2; i++) {
+          if (remainingCandidates.length === 0) break;
+
+          remainingCandidates.sort((a, b) => {
+            const coPlayA = getCoPlayCount(a.player, selected, matchHistory);
+            const coPlayB = getCoPlayCount(b.player, selected, matchHistory);
+            
+            const mixBonusA = (needFreshBlood && (a.player.consecutivePlay || 0) === 1) ? 45 : 0;
+            const mixBonusB = (needFreshBlood && (b.player.consecutivePlay || 0) === 1) ? 45 : 0;
+
+            const finalScoreA = a.score + mixBonusA - (coPlayA * 35);
+            const finalScoreB = b.score + mixBonusB - (coPlayB * 35);
+
+            return finalScoreB - finalScoreA;
+          });
+
+          selected.push(remainingCandidates.shift().player);
+        }
+      } else {
+        selected.push(scoredPlayers[0].player);
+        let remainingCandidates = scoredPlayers.slice(1);
+
+        for (let i = 0; i < 3; i++) {
+          remainingCandidates.sort((a, b) => {
+            const coPlayA = getCoPlayCount(a.player, selected, matchHistory);
+            const coPlayB = getCoPlayCount(b.player, selected, matchHistory);
+            return (b.score - coPlayB * 30) - (a.score - coPlayA * 30);
+          });
+          selected.push(remainingCandidates.shift().player);
         }
       }
 
@@ -458,7 +516,7 @@
           }
         });
 
-        state.history.unshift({
+        state.history.push({
           matchNumber: state.currentMatch.matchNumber || (state.history.length + 1),
           teamAIds: [...state.currentMatch.teamA],
           teamBIds: [...state.currentMatch.teamB],
@@ -488,23 +546,61 @@
       syncToFirebase();
     }
 
+    // 修改處 2：替換球員支援「場上互換位置（打亂夥伴）」與「換上場下球員」
     function openSwapModal() {
       if (!state.currentMatch) return;
-      const currentIds = [...state.currentMatch.teamA, ...state.currentMatch.teamB];
-      const onCourt = state.players.filter(p => currentIds.includes(p.id));
-      const onBench = state.players.filter(p => !currentIds.includes(p.id) && p.status === 'active');
+      const { teamA, teamB } = state.currentMatch;
+      const currentIds = [...teamA, ...teamB];
+      const onCourt = currentIds
+        .map(id => state.players.find(p => p.id === id))
+        .filter(Boolean);
 
-      if (onBench.length === 0) {
-        alert('目前場下沒有其他在場球員可供替換！');
+      const allActive = state.players.filter(p => p.status === 'active');
+      if (allActive.length <= 1) {
+        alert('目前沒有其他在場球員可供替換或調整！');
         return;
       }
 
       const outSelect = document.getElementById('swap-out-select');
-      const inSelect = document.getElementById('swap-in-select');
-      outSelect.innerHTML = onCourt.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
-      inSelect.innerHTML = onBench.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
+      outSelect.innerHTML = onCourt.map(p => {
+        const teamLabel = teamA.includes(p.id) ? '組合 A' : '組合 B';
+        return `<option value="${p.id}">${p.name}（目前：${teamLabel}）</option>`;
+      }).join('');
 
+      updateSwapInOptions();
       document.getElementById('swap-modal').style.display = 'flex';
+    }
+
+    function updateSwapInOptions() {
+      if (!state.currentMatch) return;
+      const { teamA, teamB } = state.currentMatch;
+      const currentIds = [...teamA, ...teamB];
+      const outId = document.getElementById('swap-out-select').value;
+      const inSelect = document.getElementById('swap-in-select');
+
+      // 取得「除了當前選中要換下的那位之外」的所有在場球員（包含場上另外3人 + 場下休息者）
+      const candidates = state.players.filter(p => p.status === 'active' && p.id !== outId);
+
+      // 場下休息排前面、場上互換排後面，並清楚標示身分
+      const benchCandidates = candidates.filter(p => !currentIds.includes(p.id));
+      const courtCandidates = candidates.filter(p => currentIds.includes(p.id));
+
+      let optionsHtml = '';
+      if (benchCandidates.length > 0) {
+        optionsHtml += `<optgroup label="場下休息球員（替換上場）">`;
+        optionsHtml += benchCandidates.map(p => `<option value="${p.id}">${p.name}（場下休息）</option>`).join('');
+        optionsHtml += `</optgroup>`;
+      }
+      if (courtCandidates.length > 0) {
+        optionsHtml += `<optgroup label="場上其他球員（互換位置 / 換搭檔）">`;
+        optionsHtml += courtCandidates.map(p => {
+          const teamLabel = teamA.includes(p.id) ? '組合 A' : '組合 B';
+          return `<option value="${p.id}">${p.name}（場上互換 - ${teamLabel}）</option>`;
+        }).join('');
+        optionsHtml += `</optgroup>`;
+      }
+
+      inSelect.innerHTML = optionsHtml;
     }
 
     function closeSwapModal() {
@@ -515,16 +611,31 @@
       if (!state.currentMatch) return;
       const outId = document.getElementById('swap-out-select').value;
       const inId = document.getElementById('swap-in-select').value;
+      if (!outId || !inId || outId === inId) return;
 
       let { teamA, teamB } = state.currentMatch;
-      if (teamA.includes(outId)) {
-        teamA = teamA.map(id => id === outId ? inId : id);
+      const isInOnCourt = teamA.includes(inId) || teamB.includes(inId);
+
+      if (isInOnCourt) {
+        // 場上兩位球員互換位置（打亂隊友組合）
+        const swapTwoIds = arr => arr.map(id => {
+          if (id === outId) return inId;
+          if (id === inId) return outId;
+          return id;
+        });
+        teamA = swapTwoIds(teamA);
+        teamB = swapTwoIds(teamB);
       } else {
-        teamB = teamB.map(id => id === outId ? inId : id);
+        // 場下球員替換場上球員
+        if (teamA.includes(outId)) {
+          teamA = teamA.map(id => id === outId ? inId : id);
+        } else {
+          teamB = teamB.map(id => id === outId ? inId : id);
+        }
       }
+
       state.currentMatch.teamA = teamA;
       state.currentMatch.teamB = teamB;
-
       state.upcomingMatch = generateUpcomingMatch(state.currentMatch);
 
       closeSwapModal();
@@ -699,15 +810,16 @@
         const activeInputId = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.playerId : null;
 
         tbody.innerHTML = players.map(p => {
-          const selectColorClass = p.status === 'active' 
+          // 修改處 1：出勤狀態只保留「在場 (active)」與「不在場 (absent)」
+          const isActive = p.status === 'active';
+          const selectColorClass = isActive 
             ? 'bg-green-50 text-green-700 border-green-200' 
-            : (p.status === 'late' ? 'bg-yellow-50 text-yellow-700 border-yellow-200' : 'bg-gray-100 text-gray-600 border-gray-300');
+            : 'bg-gray-100 text-gray-600 border-gray-300';
 
           const statusSelect = `
             <select onchange="changePlayerStatus('${p.id}', this.value)" class="text-xs font-bold px-2 py-1 rounded-lg border focus:outline-none ${selectColorClass}">
-              <option value="active" ${p.status === 'active' ? 'selected' : ''}>🟢 在場</option>
-              <option value="late" ${p.status === 'late' ? 'selected' : ''}>🟡 遲到/未到</option>
-              <option value="left" ${p.status === 'left' ? 'selected' : ''}>⚪ 早退</option>
+              <option value="active" ${isActive ? 'selected' : ''}>🟢 在場</option>
+              <option value="absent" ${!isActive ? 'selected' : ''}>⚪ 不在場</option>
             </select>
           `;
 
@@ -749,7 +861,7 @@
       document.getElementById('total-summary').textContent = `在場球員: ${activeCount} 人 / 總球員: ${players.length} 人`;
 
       const historyContainer = document.getElementById('history-container');
-      const historyList = state.history || [];
+      const historyList = [...(state.history || [])].sort((a, b) => (a.matchNumber || 0) - (b.matchNumber || 0));
       document.getElementById('history-count').textContent = `共 ${historyList.length} 場`;
 
       if (historyList.length === 0) {
