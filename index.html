@@ -260,41 +260,35 @@
     const roomId = window.location.hash.replace('#', '') || 'main-court';
     const roomRef = db.ref('rooms/' + roomId);
 
-    // 定義乾淨的初始狀態工廠函式（單一真實來源）
     function createEmptyState() {
       return {
         players: [],
         currentMatch: null,
         upcomingMatch: null,
         history: [],
-        isRosterLocked: false, // false 代表編輯中（未鎖定），true 代表已儲存鎖定
+        isRosterLocked: false,
+        version: 1,
         updatedAt: Date.now()
       };
     }
 
     let state = createEmptyState();
-    let lastSyncedTimestamp = 0; // 用來防止舊封包覆蓋新狀態
 
-    // 監聽 Firebase 即時資料（所有手機的唯一狀態來源）
+    // 監聽 Firebase 即時資料（單一真實來源）
     roomRef.on('value', (snapshot) => {
       const data = snapshot.val();
       if (data) {
-        // 防呆：如果收到的資料比本地已確認的時間戳還舊，直接忽略
-        if (data.updatedAt && data.updatedAt < lastSyncedTimestamp) {
-          return;
-        }
-        lastSyncedTimestamp = data.updatedAt || Date.now();
-
-        state.players = data.players || [];
-        state.currentMatch = data.currentMatch || null;
-        state.upcomingMatch = data.upcomingMatch || null;
-        state.history = data.history || [];
-        state.isRosterLocked = Boolean(data.isRosterLocked);
-        state.updatedAt = data.updatedAt || Date.now();
+        state = {
+          players: data.players || [],
+          currentMatch: data.currentMatch || null,
+          upcomingMatch: data.upcomingMatch || null,
+          history: data.history || [],
+          isRosterLocked: Boolean(data.isRosterLocked),
+          version: data.version || 1,
+          updatedAt: data.updatedAt || Date.now()
+        };
       } else {
-        // 若遠端節點完全不存在，初始化一份乾淨狀態
         state = createEmptyState();
-        lastSyncedTimestamp = state.updatedAt;
       }
 
       render();
@@ -302,27 +296,62 @@
       document.getElementById('sync-badge').innerHTML = '<span class="w-2 h-2 rounded-full bg-green-300"></span> <span>即時同步中</span>';
     });
 
-    // 統一寫入入口：每次寫入都壓上最新時間戳
-    function syncToFirebase() {
-      state.updatedAt = Date.now();
-      lastSyncedTimestamp = state.updatedAt;
-      roomRef.set(state);
+    // 核心：Firebase Transaction 樂觀鎖寫入器
+    function commitStateChange(mutatorFn, onDone) {
+      let abortReason = null;
+
+      roomRef.transaction((currentRemoteData) => {
+        abortReason = null; // 每次重試先清空中止原因
+
+        const baseState = currentRemoteData ? {
+          players: currentRemoteData.players || [],
+          currentMatch: currentRemoteData.currentMatch || null,
+          upcomingMatch: currentRemoteData.upcomingMatch || null,
+          history: currentRemoteData.history || [],
+          isRosterLocked: Boolean(currentRemoteData.isRosterLocked),
+          version: currentRemoteData.version || 0
+        } : createEmptyState();
+
+        // 執行狀態變更；若回傳字串代表業務邏輯擋下（例如人數不足），記錄原因並中止
+        const result = mutatorFn(baseState);
+        if (typeof result === 'string') {
+          abortReason = result;
+          return; // 回傳 undefined 會正式中止 Transaction
+        }
+        if (!result) {
+          return;
+        }
+
+        result.version = (baseState.version || 0) + 1;
+        result.updatedAt = Date.now();
+        return result;
+      }, (error, committed, snapshot) => {
+        if (error) {
+          console.error('Firebase Transaction Error:', error);
+          alert('網路同步發生異常，請重試！');
+          return;
+        }
+        if (!committed && abortReason) {
+          alert(abortReason);
+          return;
+        }
+        if (committed && onDone) {
+          onDone(snapshot.val());
+        }
+      });
     }
 
-    // 根據 state.isRosterLocked 同步所有手機的「輸入框鎖定狀態」與「文字內容」
     function syncRosterUIWithState() {
       const textarea = document.getElementById('roster-textarea');
       const btn = document.getElementById('btn-toggle-save');
       const lockStatus = document.getElementById('roster-lock-status');
       const tip = document.getElementById('roster-tip');
 
-      // 只有當使用者沒有正在打字（focus）時，才同步文字內容，避免打字被打斷
       if (document.activeElement !== textarea) {
         textarea.value = (state.players || []).map(p => p.name).join('\n');
       }
 
       if (state.isRosterLocked) {
-        // 狀態：已儲存鎖定
         textarea.disabled = true;
         textarea.className = "w-full text-sm font-medium p-2.5 border rounded-lg focus:outline-none transition bg-gray-100 border-gray-300 text-gray-500 cursor-not-allowed";
 
@@ -334,7 +363,6 @@
         btn.innerHTML = '<i class="fa-solid fa-pen-to-square mr-1"></i><span>批次編輯名冊</span>';
         btn.className = "text-xs px-4 py-1.5 rounded-lg font-semibold shadow-sm transition flex items-center space-x-1 bg-gray-700 hover:bg-gray-800 text-white";
       } else {
-        // 狀態：編輯中（未鎖定）
         textarea.disabled = false;
         textarea.className = "w-full text-sm font-medium p-2.5 border rounded-lg focus:outline-none transition bg-white border-green-500 ring-2 ring-green-100 text-gray-800 cursor-text";
 
@@ -348,26 +376,25 @@
       }
     }
 
+    // 1. 修改單一球員名字
     function updatePlayerName(id, newName) {
       const trimmed = newName.trim();
-      const p = (state.players || []).find(x => x.id === id);
-      if (!p) return;
-
       if (!trimmed) {
         render();
         return;
       }
 
-      if (p.name !== trimmed) {
+      commitStateChange((remoteState) => {
+        const p = remoteState.players.find(x => x.id === id);
+        if (!p || p.name === trimmed) return null; // 沒改動或人已被清空則取消
         p.name = trimmed;
-        syncToFirebase();
-      }
+        return remoteState;
+      });
     }
 
-    function getPairHistoryCount(p1Id, p2Id) {
-      const historyList = state.history || [];
+    function getPairHistoryCount(p1Id, p2Id, historyList) {
       let count = 0;
-      for (const h of historyList) {
+      for (const h of (historyList || [])) {
         if (!h.teamAIds || !h.teamBIds) continue;
         const inA = h.teamAIds.includes(p1Id) && h.teamAIds.includes(p2Id);
         const inB = h.teamBIds.includes(p1Id) && h.teamBIds.includes(p2Id);
@@ -376,24 +403,24 @@
       return count;
     }
 
-    function divideIntoBestTeams(fourPlayers) {
+    function divideIntoBestTeams(fourPlayers, historyList) {
       const [p1, p2, p3, p4] = fourPlayers;
       
       const configurations = [
         {
           teamA: [p1.id, p2.id],
           teamB: [p3.id, p4.id],
-          cost: getPairHistoryCount(p1.id, p2.id) + getPairHistoryCount(p3.id, p4.id)
+          cost: getPairHistoryCount(p1.id, p2.id, historyList) + getPairHistoryCount(p3.id, p4.id, historyList)
         },
         {
           teamA: [p1.id, p3.id],
           teamB: [p2.id, p4.id],
-          cost: getPairHistoryCount(p1.id, p3.id) + getPairHistoryCount(p2.id, p4.id)
+          cost: getPairHistoryCount(p1.id, p3.id, historyList) + getPairHistoryCount(p2.id, p4.id, historyList)
         },
         {
           teamA: [p1.id, p4.id],
           teamB: [p2.id, p3.id],
-          cost: getPairHistoryCount(p1.id, p4.id) + getPairHistoryCount(p2.id, p3.id)
+          cost: getPairHistoryCount(p1.id, p4.id, historyList) + getPairHistoryCount(p2.id, p3.id, historyList)
         }
       ];
 
@@ -430,10 +457,10 @@
       return count;
     }
 
-    function pickFourPlayers(playerPool, matchHistory = state.history || []) {
+    function pickFourPlayers(playerPool, matchHistory) {
       const N = playerPool.length;
       if (N < 4) return null;
-      if (N === 4) return divideIntoBestTeams(playerPool);
+      if (N === 4) return divideIntoBestTeams(playerPool, matchHistory);
 
       let maxConsecutivePlay = 2;
       if (N === 5) maxConsecutivePlay = 4;
@@ -514,11 +541,11 @@
         }
       }
 
-      return divideIntoBestTeams(selected);
+      return divideIntoBestTeams(selected, matchHistory);
     }
 
-    function generateUpcomingMatch(currentMatchSelection) {
-      const activePlayers = (state.players || []).filter(p => p.status === 'active');
+    function generateUpcomingMatch(currentMatchSelection, allPlayers, matchHistory) {
+      const activePlayers = (allPlayers || []).filter(p => p.status === 'active');
       if (activePlayers.length < 4) return null;
 
       const currentIds = [...currentMatchSelection.teamA, ...currentMatchSelection.teamB];
@@ -536,86 +563,100 @@
         return copy;
       });
 
-      return pickFourPlayers(simulatedPlayers);
+      return pickFourPlayers(simulatedPlayers, matchHistory);
     }
 
+    // 2. 開始第一場 / 完成本場並進入下一場（具備防併發覆蓋保護）
     function handleFinishAndNext() {
-      // 防呆：檢查全場共用的 state.isRosterLocked 狀態
+      // 本地先做一次快速 UI 防呆，改善體感
       if (!state.isRosterLocked) {
         alert('⚠️ 名單尚在編輯中，請先點擊「儲存名冊」鎖定後再進行排賽！');
         const box = document.getElementById('roster-editor');
-        if (box.style.display === 'none') {
-          toggleRosterEdit();
-        }
+        if (box.style.display === 'none') toggleRosterEdit();
         document.getElementById('btn-toggle-save').focus();
         return;
       }
 
-      const activePlayers = (state.players || []).filter(p => p.status === 'active');
-      const getName = id => (state.players.find(p => p.id === id) || {}).name || '未知';
+      const wasPlayingLocally = Boolean(state.currentMatch);
+      let postMessage = null;
 
-      if (!state.currentMatch) {
+      commitStateChange((remoteState) => {
+        // 併發檢查 1：若這幾毫秒內有人解鎖了名冊，中止排賽
+        if (!remoteState.isRosterLocked) {
+          return '⚠️ 名單剛剛被其他管理員解鎖編輯中，請先確認並「儲存名冊」後再排賽！';
+        }
+
+        // 併發檢查 2（關鍵！）：如果我原本要「完成本場進入下一場」，但這毫秒內遠端剛好被別人清空了
+        if (wasPlayingLocally && !remoteState.currentMatch) {
+          return '⚠️ 賽況剛剛已被其他管理員清空重置，本次「下一場」操作已自動取消！';
+        }
+
+        const activePlayers = remoteState.players.filter(p => p.status === 'active');
+        const getName = id => (remoteState.players.find(p => p.id === id) || {}).name || '未知';
+
+        // 情況一：尚未開賽，安排第一場
+        if (!remoteState.currentMatch) {
+          if (activePlayers.length < 4) {
+            return '在場人數不足 4 人，無法安排雙打比賽！';
+          }
+          const firstMatch = pickFourPlayers(activePlayers, remoteState.history);
+          remoteState.currentMatch = {
+            ...firstMatch,
+            matchNumber: 1
+          };
+          remoteState.upcomingMatch = generateUpcomingMatch(remoteState.currentMatch, remoteState.players, remoteState.history);
+          return remoteState;
+        }
+
+        // 情況二：結算本場並進下一場
+        const currentIds = [...remoteState.currentMatch.teamA, ...remoteState.currentMatch.teamB];
+        remoteState.players.forEach(p => {
+          if (currentIds.includes(p.id)) {
+            p.played = (p.played || 0) + 1;
+            p.consecutivePlay = (p.consecutivePlay || 0) + 1;
+            p.consecutiveRest = 0;
+          } else if (p.status === 'active') {
+            p.consecutivePlay = 0;
+            p.consecutiveRest = (p.consecutiveRest || 0) + 1;
+          }
+        });
+
+        remoteState.history.push({
+          matchNumber: remoteState.currentMatch.matchNumber || (remoteState.history.length + 1),
+          teamAIds: [...remoteState.currentMatch.teamA],
+          teamBIds: [...remoteState.currentMatch.teamB],
+          teamANames: [getName(remoteState.currentMatch.teamA[0]), getName(remoteState.currentMatch.teamA[1])],
+          teamBNames: [getName(remoteState.currentMatch.teamB[0]), getName(remoteState.currentMatch.teamB[1])],
+          time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        });
+
         if (activePlayers.length < 4) {
-          alert('在場人數不足 4 人，無法安排雙打比賽！');
-          return;
+          remoteState.currentMatch = null;
+          remoteState.upcomingMatch = null;
+          postMessage = '本場已結算並寫入紀錄！但目前在場人數不足 4 人，已暫停自動排賽。';
+          return remoteState;
         }
 
-        const firstMatch = pickFourPlayers(activePlayers);
-        state.currentMatch = {
-          ...firstMatch,
-          matchNumber: 1
+        let nextMatch = remoteState.upcomingMatch;
+        const validNext = nextMatch && [...nextMatch.teamA, ...nextMatch.teamB].every(id => 
+          activePlayers.some(p => p.id === id)
+        );
+
+        if (!validNext) {
+          nextMatch = pickFourPlayers(activePlayers, remoteState.history);
+        }
+
+        const nextMatchNum = (remoteState.history.length || 0) + 1;
+        remoteState.currentMatch = {
+          ...nextMatch,
+          matchNumber: nextMatchNum
         };
-        state.upcomingMatch = generateUpcomingMatch(state.currentMatch);
-        syncToFirebase();
-        return;
-      }
+        remoteState.upcomingMatch = generateUpcomingMatch(remoteState.currentMatch, remoteState.players, remoteState.history);
 
-      const currentIds = [...state.currentMatch.teamA, ...state.currentMatch.teamB];
-      state.players.forEach(p => {
-        if (currentIds.includes(p.id)) {
-          p.played = (p.played || 0) + 1;
-          p.consecutivePlay = (p.consecutivePlay || 0) + 1;
-          p.consecutiveRest = 0;
-        } else if (p.status === 'active') {
-          p.consecutivePlay = 0;
-          p.consecutiveRest = (p.consecutiveRest || 0) + 1;
-        }
+        return remoteState;
+      }, () => {
+        if (postMessage) alert(postMessage);
       });
-
-      state.history.push({
-        matchNumber: state.currentMatch.matchNumber || (state.history.length + 1),
-        teamAIds: [...state.currentMatch.teamA],
-        teamBIds: [...state.currentMatch.teamB],
-        teamANames: [getName(state.currentMatch.teamA[0]), getName(state.currentMatch.teamA[1])],
-        teamBNames: [getName(state.currentMatch.teamB[0]), getName(state.currentMatch.teamB[1])],
-        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-      });
-
-      if (activePlayers.length < 4) {
-        state.currentMatch = null;
-        state.upcomingMatch = null;
-        syncToFirebase();
-        alert('本場已結算並寫入紀錄！但目前在場人數不足 4 人，已暫停自動排賽。');
-        return;
-      }
-
-      let nextMatch = state.upcomingMatch;
-      const validNext = nextMatch && [...nextMatch.teamA, ...nextMatch.teamB].every(id => 
-        activePlayers.some(p => p.id === id)
-      );
-
-      if (!validNext) {
-        nextMatch = pickFourPlayers(activePlayers);
-      }
-
-      const nextMatchNum = (state.history.length || 0) + 1;
-      state.currentMatch = {
-        ...nextMatch,
-        matchNumber: nextMatchNum
-      };
-
-      state.upcomingMatch = generateUpcomingMatch(state.currentMatch);
-      syncToFirebase();
     }
 
     function openSwapModal() {
@@ -675,37 +716,43 @@
       document.getElementById('swap-modal').style.display = 'none';
     }
 
+    // 3. 確認替換場上球員
     function confirmSwap() {
-      if (!state.currentMatch) return;
       const outId = document.getElementById('swap-out-select').value;
       const inId = document.getElementById('swap-in-select').value;
       if (!outId || !inId || outId === inId) return;
 
-      let { teamA, teamB } = state.currentMatch;
-      const isInOnCourt = teamA.includes(inId) || teamB.includes(inId);
-
-      if (isInOnCourt) {
-        const swapTwoIds = arr => arr.map(id => {
-          if (id === outId) return inId;
-          if (id === inId) return outId;
-          return id;
-        });
-        teamA = swapTwoIds(teamA);
-        teamB = swapTwoIds(teamB);
-      } else {
-        if (teamA.includes(outId)) {
-          teamA = teamA.map(id => id === outId ? inId : id);
-        } else {
-          teamB = teamB.map(id => id === outId ? inId : id);
+      commitStateChange((remoteState) => {
+        if (!remoteState.currentMatch) {
+          return '目前場上已無進行中的比賽，無法替換！';
         }
-      }
 
-      state.currentMatch.teamA = teamA;
-      state.currentMatch.teamB = teamB;
-      state.upcomingMatch = generateUpcomingMatch(state.currentMatch);
+        let { teamA, teamB } = remoteState.currentMatch;
+        const isInOnCourt = teamA.includes(inId) || teamB.includes(inId);
 
-      closeSwapModal();
-      syncToFirebase();
+        if (isInOnCourt) {
+          const swapTwoIds = arr => arr.map(id => {
+            if (id === outId) return inId;
+            if (id === inId) return outId;
+            return id;
+          });
+          teamA = swapTwoIds(teamA);
+          teamB = swapTwoIds(teamB);
+        } else {
+          if (teamA.includes(outId)) {
+            teamA = teamA.map(id => id === outId ? inId : id);
+          } else {
+            teamB = teamB.map(id => id === outId ? inId : id);
+          }
+        }
+
+        remoteState.currentMatch.teamA = teamA;
+        remoteState.currentMatch.teamB = teamB;
+        remoteState.upcomingMatch = generateUpcomingMatch(remoteState.currentMatch, remoteState.players, remoteState.history);
+        return remoteState;
+      }, () => {
+        closeSwapModal();
+      });
     }
 
     function toggleRosterEdit() {
@@ -725,75 +772,98 @@
       }
     }
 
+    // 4. 儲存名冊 / 解鎖批次編輯
     function handleRosterButtonClick() {
       const textarea = document.getElementById('roster-textarea');
 
       if (state.isRosterLocked) {
-        // 從「已鎖定」切換為「解鎖編輯中」，並同步給所有人
-        state.isRosterLocked = false;
-        syncToFirebase();
-        setTimeout(() => textarea.focus(), 50);
+        commitStateChange((remoteState) => {
+          remoteState.isRosterLocked = false;
+          return remoteState;
+        }, () => {
+          setTimeout(() => textarea.focus(), 50);
+        });
       } else {
-        // 從「編輯中」儲存並鎖定名冊，同步給所有人
         const lines = textarea.value
           .split('\n')
           .map(s => s.trim())
           .filter(s => s.length > 0);
 
-        const existingPlayers = state.players || [];
-        const newPlayers = lines.map(name => {
-          const exist = existingPlayers.find(p => p.name === name);
-          if (exist) return exist;
-          return {
-            id: '_' + Math.random().toString(36).substr(2, 9),
-            name: name,
-            status: 'active',
-            played: 0,
-            consecutivePlay: 0,
-            consecutiveRest: 0
-          };
+        commitStateChange((remoteState) => {
+          const existingPlayers = remoteState.players || [];
+          const newPlayers = lines.map(name => {
+            const exist = existingPlayers.find(p => p.name === name);
+            if (exist) return exist;
+            return {
+              id: '_' + Math.random().toString(36).substr(2, 9),
+              name: name,
+              status: 'active',
+              played: 0,
+              consecutivePlay: 0,
+              consecutiveRest: 0
+            };
+          });
+
+          remoteState.players = newPlayers;
+          remoteState.isRosterLocked = true;
+
+          if (remoteState.currentMatch) {
+            remoteState.upcomingMatch = generateUpcomingMatch(remoteState.currentMatch, remoteState.players, remoteState.history);
+          }
+          return remoteState;
         });
-
-        state.players = newPlayers;
-        state.isRosterLocked = true;
-
-        if (state.currentMatch) {
-          state.upcomingMatch = generateUpcomingMatch(state.currentMatch);
-        }
-        syncToFirebase();
       }
     }
 
+    // 5. 切換出勤狀態（在場 / 不在場）
     function changePlayerStatus(id, newStatus) {
-      const p = (state.players || []).find(x => x.id === id);
-      if (p) {
+      commitStateChange((remoteState) => {
+        const p = remoteState.players.find(x => x.id === id);
+        if (!p) return null;
         p.status = newStatus;
-        if (state.currentMatch) {
-          state.upcomingMatch = generateUpcomingMatch(state.currentMatch);
+        if (remoteState.currentMatch) {
+          remoteState.upcomingMatch = generateUpcomingMatch(remoteState.currentMatch, remoteState.players, remoteState.history);
         }
-        syncToFirebase();
-      }
+        return remoteState;
+      });
     }
 
+    // 1. 點擊「完成所有比賽 (清空結算)」按鈕時先檢查是否已鎖定名冊
     function openEndSessionModal() { 
+      if (!state.isRosterLocked) {
+        alert('⚠️ 名單尚在編輯中，請先點擊「儲存名冊」鎖定後，再進行清空結算！');
+        const box = document.getElementById('roster-editor');
+        if (box.style.display === 'none') toggleRosterEdit();
+        document.getElementById('btn-toggle-save').focus();
+        return;
+      }
       document.getElementById('end-session-modal').style.display = 'flex'; 
     }
+
     function closeEndSessionModal() { 
       document.getElementById('end-session-modal').style.display = 'none'; 
     }
 
-    // 徹底解決清空後復活的問題：覆寫成帶有最新時間戳的空狀態物件，而非 remove()
+    // 2. 執行清空（Transaction 內部同樣驗證遠端狀態必須為已鎖定）
     function executeEndAllMatches() {
-      state = createEmptyState();
-      
       const textarea = document.getElementById('roster-textarea');
       if (textarea) {
-        textarea.blur(); // 解除 focus 確保 UI 會被清空
+        textarea.blur();
         textarea.value = '';
       }
 
-      closeEndSessionModal();
-      syncToFirebase(); // 用最新 timestamp 的空狀態覆蓋遠端，所有手機會強制同步歸零
+      commitStateChange((remoteState) => {
+        // 併發防呆：若確認彈窗期間有其他人解鎖了名冊，則中止清空
+        if (!remoteState.isRosterLocked) {
+          return '⚠️ 名單剛剛被其他管理員解鎖編輯中，已取消清空操作！';
+        }
+
+        const empty = createEmptyState();
+        empty.version = remoteState.version; // 繼承遠端版號，寫入時自動 +1
+        return empty;
+      }, () => {
+        closeEndSessionModal();
+      });
     }
 
     function render() {
