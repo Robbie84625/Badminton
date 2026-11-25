@@ -260,38 +260,91 @@
     const roomId = window.location.hash.replace('#', '') || 'main-court';
     const roomRef = db.ref('rooms/' + roomId);
 
-    let state = {
-      players: [],
-      currentMatch: null,
-      upcomingMatch: null,
-      history: []
-    };
+    // 定義乾淨的初始狀態工廠函式（單一真實來源）
+    function createEmptyState() {
+      return {
+        players: [],
+        currentMatch: null,
+        upcomingMatch: null,
+        history: [],
+        isRosterLocked: false, // false 代表編輯中（未鎖定），true 代表已儲存鎖定
+        updatedAt: Date.now()
+      };
+    }
 
-    let isEditingRoster = true;
+    let state = createEmptyState();
+    let lastSyncedTimestamp = 0; // 用來防止舊封包覆蓋新狀態
 
+    // 監聽 Firebase 即時資料（所有手機的唯一狀態來源）
     roomRef.on('value', (snapshot) => {
       const data = snapshot.val();
       if (data) {
+        // 防呆：如果收到的資料比本地已確認的時間戳還舊，直接忽略
+        if (data.updatedAt && data.updatedAt < lastSyncedTimestamp) {
+          return;
+        }
+        lastSyncedTimestamp = data.updatedAt || Date.now();
+
         state.players = data.players || [];
         state.currentMatch = data.currentMatch || null;
         state.upcomingMatch = data.upcomingMatch || null;
         state.history = data.history || [];
+        state.isRosterLocked = Boolean(data.isRosterLocked);
+        state.updatedAt = data.updatedAt || Date.now();
       } else {
-        syncToFirebase();
+        // 若遠端節點完全不存在，初始化一份乾淨狀態
+        state = createEmptyState();
+        lastSyncedTimestamp = state.updatedAt;
       }
+
       render();
-      syncTextareaWithState();
+      syncRosterUIWithState();
       document.getElementById('sync-badge').innerHTML = '<span class="w-2 h-2 rounded-full bg-green-300"></span> <span>即時同步中</span>';
     });
 
+    // 統一寫入入口：每次寫入都壓上最新時間戳
     function syncToFirebase() {
+      state.updatedAt = Date.now();
+      lastSyncedTimestamp = state.updatedAt;
       roomRef.set(state);
     }
 
-    function syncTextareaWithState() {
+    // 根據 state.isRosterLocked 同步所有手機的「輸入框鎖定狀態」與「文字內容」
+    function syncRosterUIWithState() {
       const textarea = document.getElementById('roster-textarea');
+      const btn = document.getElementById('btn-toggle-save');
+      const lockStatus = document.getElementById('roster-lock-status');
+      const tip = document.getElementById('roster-tip');
+
+      // 只有當使用者沒有正在打字（focus）時，才同步文字內容，避免打字被打斷
       if (document.activeElement !== textarea) {
         textarea.value = (state.players || []).map(p => p.name).join('\n');
+      }
+
+      if (state.isRosterLocked) {
+        // 狀態：已儲存鎖定
+        textarea.disabled = true;
+        textarea.className = "w-full text-sm font-medium p-2.5 border rounded-lg focus:outline-none transition bg-gray-100 border-gray-300 text-gray-500 cursor-not-allowed";
+
+        lockStatus.innerHTML = '<i class="fa-solid fa-lock text-[10px] mr-1"></i>已鎖定';
+        lockStatus.className = "text-[11px] px-2 py-0.5 rounded-full font-medium bg-gray-200 text-gray-600";
+
+        tip.textContent = "點擊右側「批次編輯名冊」以大批增減成員";
+
+        btn.innerHTML = '<i class="fa-solid fa-pen-to-square mr-1"></i><span>批次編輯名冊</span>';
+        btn.className = "text-xs px-4 py-1.5 rounded-lg font-semibold shadow-sm transition flex items-center space-x-1 bg-gray-700 hover:bg-gray-800 text-white";
+      } else {
+        // 狀態：編輯中（未鎖定）
+        textarea.disabled = false;
+        textarea.className = "w-full text-sm font-medium p-2.5 border rounded-lg focus:outline-none transition bg-white border-green-500 ring-2 ring-green-100 text-gray-800 cursor-text";
+
+        lockStatus.innerHTML = '<i class="fa-solid fa-unlock text-[10px] mr-1"></i>編輯中';
+        lockStatus.className = "text-[11px] px-2 py-0.5 rounded-full font-medium bg-amber-100 text-amber-700";
+
+        tip.textContent = "修改完畢後請點擊「儲存名冊」";
+
+        btn.innerHTML = '<i class="fa-solid fa-check mr-1"></i><span>儲存名冊</span>';
+        btn.className = "text-xs px-4 py-1.5 rounded-lg font-semibold shadow-sm transition flex items-center space-x-1 bg-green-600 hover:bg-green-700 text-white";
       }
     }
 
@@ -487,66 +540,84 @@
     }
 
     function handleFinishAndNext() {
-      const activePlayers = (state.players || []).filter(p => p.status === 'active');
-      if (activePlayers.length < 4) {
-        alert('在場人數不足 4 人，無法安排雙打比賽！');
+      // 防呆：檢查全場共用的 state.isRosterLocked 狀態
+      if (!state.isRosterLocked) {
+        alert('⚠️ 名單尚在編輯中，請先點擊「儲存名冊」鎖定後再進行排賽！');
+        const box = document.getElementById('roster-editor');
+        if (box.style.display === 'none') {
+          toggleRosterEdit();
+        }
+        document.getElementById('btn-toggle-save').focus();
         return;
       }
 
+      const activePlayers = (state.players || []).filter(p => p.status === 'active');
       const getName = id => (state.players.find(p => p.id === id) || {}).name || '未知';
 
       if (!state.currentMatch) {
+        if (activePlayers.length < 4) {
+          alert('在場人數不足 4 人，無法安排雙打比賽！');
+          return;
+        }
+
         const firstMatch = pickFourPlayers(activePlayers);
         state.currentMatch = {
           ...firstMatch,
           matchNumber: 1
         };
         state.upcomingMatch = generateUpcomingMatch(state.currentMatch);
-
-      } else {
-        const currentIds = [...state.currentMatch.teamA, ...state.currentMatch.teamB];
-        state.players.forEach(p => {
-          if (currentIds.includes(p.id)) {
-            p.played = (p.played || 0) + 1;
-            p.consecutivePlay = (p.consecutivePlay || 0) + 1;
-            p.consecutiveRest = 0;
-          } else if (p.status === 'active') {
-            p.consecutivePlay = 0;
-            p.consecutiveRest = (p.consecutiveRest || 0) + 1;
-          }
-        });
-
-        state.history.push({
-          matchNumber: state.currentMatch.matchNumber || (state.history.length + 1),
-          teamAIds: [...state.currentMatch.teamA],
-          teamBIds: [...state.currentMatch.teamB],
-          teamANames: [getName(state.currentMatch.teamA[0]), getName(state.currentMatch.teamA[1])],
-          teamBNames: [getName(state.currentMatch.teamB[0]), getName(state.currentMatch.teamB[1])],
-          time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-        });
-
-        let nextMatch = state.upcomingMatch;
-        const validNext = nextMatch && [...nextMatch.teamA, ...nextMatch.teamB].every(id => 
-          activePlayers.some(p => p.id === id)
-        );
-
-        if (!validNext) {
-          nextMatch = pickFourPlayers(activePlayers);
-        }
-
-        const nextMatchNum = (state.history.length || 0) + 1;
-        state.currentMatch = {
-          ...nextMatch,
-          matchNumber: nextMatchNum
-        };
-
-        state.upcomingMatch = generateUpcomingMatch(state.currentMatch);
+        syncToFirebase();
+        return;
       }
 
+      const currentIds = [...state.currentMatch.teamA, ...state.currentMatch.teamB];
+      state.players.forEach(p => {
+        if (currentIds.includes(p.id)) {
+          p.played = (p.played || 0) + 1;
+          p.consecutivePlay = (p.consecutivePlay || 0) + 1;
+          p.consecutiveRest = 0;
+        } else if (p.status === 'active') {
+          p.consecutivePlay = 0;
+          p.consecutiveRest = (p.consecutiveRest || 0) + 1;
+        }
+      });
+
+      state.history.push({
+        matchNumber: state.currentMatch.matchNumber || (state.history.length + 1),
+        teamAIds: [...state.currentMatch.teamA],
+        teamBIds: [...state.currentMatch.teamB],
+        teamANames: [getName(state.currentMatch.teamA[0]), getName(state.currentMatch.teamA[1])],
+        teamBNames: [getName(state.currentMatch.teamB[0]), getName(state.currentMatch.teamB[1])],
+        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      });
+
+      if (activePlayers.length < 4) {
+        state.currentMatch = null;
+        state.upcomingMatch = null;
+        syncToFirebase();
+        alert('本場已結算並寫入紀錄！但目前在場人數不足 4 人，已暫停自動排賽。');
+        return;
+      }
+
+      let nextMatch = state.upcomingMatch;
+      const validNext = nextMatch && [...nextMatch.teamA, ...nextMatch.teamB].every(id => 
+        activePlayers.some(p => p.id === id)
+      );
+
+      if (!validNext) {
+        nextMatch = pickFourPlayers(activePlayers);
+      }
+
+      const nextMatchNum = (state.history.length || 0) + 1;
+      state.currentMatch = {
+        ...nextMatch,
+        matchNumber: nextMatchNum
+      };
+
+      state.upcomingMatch = generateUpcomingMatch(state.currentMatch);
       syncToFirebase();
     }
 
-    // 修改處 2：替換球員支援「場上互換位置（打亂夥伴）」與「換上場下球員」
     function openSwapModal() {
       if (!state.currentMatch) return;
       const { teamA, teamB } = state.currentMatch;
@@ -578,10 +649,7 @@
       const outId = document.getElementById('swap-out-select').value;
       const inSelect = document.getElementById('swap-in-select');
 
-      // 取得「除了當前選中要換下的那位之外」的所有在場球員（包含場上另外3人 + 場下休息者）
       const candidates = state.players.filter(p => p.status === 'active' && p.id !== outId);
-
-      // 場下休息排前面、場上互換排後面，並清楚標示身分
       const benchCandidates = candidates.filter(p => !currentIds.includes(p.id));
       const courtCandidates = candidates.filter(p => currentIds.includes(p.id));
 
@@ -617,7 +685,6 @@
       const isInOnCourt = teamA.includes(inId) || teamB.includes(inId);
 
       if (isInOnCourt) {
-        // 場上兩位球員互換位置（打亂隊友組合）
         const swapTwoIds = arr => arr.map(id => {
           if (id === outId) return inId;
           if (id === inId) return outId;
@@ -626,7 +693,6 @@
         teamA = swapTwoIds(teamA);
         teamB = swapTwoIds(teamB);
       } else {
-        // 場下球員替換場上球員
         if (teamA.includes(outId)) {
           teamA = teamA.map(id => id === outId ? inId : id);
         } else {
@@ -661,25 +727,14 @@
 
     function handleRosterButtonClick() {
       const textarea = document.getElementById('roster-textarea');
-      const btn = document.getElementById('btn-toggle-save');
-      const lockStatus = document.getElementById('roster-lock-status');
-      const tip = document.getElementById('roster-tip');
 
-      if (!isEditingRoster) {
-        isEditingRoster = true;
-        textarea.disabled = false;
-        textarea.className = "w-full text-sm font-medium p-2.5 border rounded-lg focus:outline-none transition bg-white border-green-500 ring-2 ring-green-100 text-gray-800 cursor-text";
-        textarea.focus();
-
-        lockStatus.innerHTML = '<i class="fa-solid fa-unlock text-[10px] mr-1"></i>編輯中';
-        lockStatus.className = "text-[11px] px-2 py-0.5 rounded-full font-medium bg-amber-100 text-amber-700";
-
-        tip.textContent = "修改完畢後請點擊「儲存名冊」";
-
-        btn.innerHTML = '<i class="fa-solid fa-check mr-1"></i><span>儲存名冊</span>';
-        btn.className = "text-xs px-4 py-1.5 rounded-lg font-semibold shadow-sm transition flex items-center space-x-1 bg-green-600 hover:bg-green-700 text-white";
-
+      if (state.isRosterLocked) {
+        // 從「已鎖定」切換為「解鎖編輯中」，並同步給所有人
+        state.isRosterLocked = false;
+        syncToFirebase();
+        setTimeout(() => textarea.focus(), 50);
       } else {
+        // 從「編輯中」儲存並鎖定名冊，同步給所有人
         const lines = textarea.value
           .split('\n')
           .map(s => s.trim())
@@ -700,22 +755,12 @@
         });
 
         state.players = newPlayers;
+        state.isRosterLocked = true;
+
         if (state.currentMatch) {
           state.upcomingMatch = generateUpcomingMatch(state.currentMatch);
         }
         syncToFirebase();
-
-        isEditingRoster = false;
-        textarea.disabled = true;
-        textarea.className = "w-full text-sm font-medium p-2.5 border rounded-lg focus:outline-none transition bg-gray-100 border-gray-300 text-gray-500 cursor-not-allowed";
-
-        lockStatus.innerHTML = '<i class="fa-solid fa-lock text-[10px] mr-1"></i>已鎖定';
-        lockStatus.className = "text-[11px] px-2 py-0.5 rounded-full font-medium bg-gray-200 text-gray-600";
-
-        tip.textContent = "點擊右側「批次編輯名冊」以大批增減成員";
-
-        btn.innerHTML = '<i class="fa-solid fa-pen-to-square mr-1"></i><span>批次編輯名冊</span>';
-        btn.className = "text-xs px-4 py-1.5 rounded-lg font-semibold shadow-sm transition flex items-center space-x-1 bg-gray-700 hover:bg-gray-800 text-white";
       }
     }
 
@@ -736,17 +781,19 @@
     function closeEndSessionModal() { 
       document.getElementById('end-session-modal').style.display = 'none'; 
     }
-    function executeEndAllMatches() {
-      state.players = [];
-      state.currentMatch = null;
-      state.upcomingMatch = null;
-      state.history = [];
 
+    // 徹底解決清空後復活的問題：覆寫成帶有最新時間戳的空狀態物件，而非 remove()
+    function executeEndAllMatches() {
+      state = createEmptyState();
+      
       const textarea = document.getElementById('roster-textarea');
-      if (textarea) textarea.value = '';
+      if (textarea) {
+        textarea.blur(); // 解除 focus 確保 UI 會被清空
+        textarea.value = '';
+      }
 
       closeEndSessionModal();
-      syncToFirebase();
+      syncToFirebase(); // 用最新 timestamp 的空狀態覆蓋遠端，所有手機會強制同步歸零
     }
 
     function render() {
@@ -796,7 +843,6 @@
         upcomingBox.style.display = 'none';
       }
 
-      // 渲染球員名冊表格
       const tbody = document.getElementById('player-table-body');
       if (players.length === 0) {
         tbody.innerHTML = `
@@ -810,7 +856,6 @@
         const activeInputId = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.playerId : null;
 
         tbody.innerHTML = players.map(p => {
-          // 修改處 1：出勤狀態只保留「在場 (active)」與「不在場 (absent)」
           const isActive = p.status === 'active';
           const selectColorClass = isActive 
             ? 'bg-green-50 text-green-700 border-green-200' 
@@ -889,5 +934,3 @@
       });
     }
   </script>
-</body>
-</html>
