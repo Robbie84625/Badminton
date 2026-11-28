@@ -88,6 +88,8 @@ function App() {
   };
 
   const changePlayerStatus = (id, newStatus) => {
+    let postAlert = null;
+
     commitStateChange(roomId, (remoteState) => {
       const p = remoteState.players.find(x => x.id === id);
       if (!p) return null;
@@ -95,14 +97,48 @@ function App() {
       if (newStatus === 'active') {
         p.consecutiveRest = 0;
       }
+
       if (remoteState.currentMatch) {
+        let { teamA, teamB } = remoteState.currentMatch;
+        const currentIds = [...teamA, ...teamB];
+
+        // 若被切換成「不在場」的人剛好正在場上打球，立即自動替換
+        if (newStatus === 'absent' && currentIds.includes(id)) {
+          const remoteActive = remoteState.players.filter(x => x.status === 'active');
+
+          if (remoteActive.length < 4) {
+            // 在場人數不足 4 人，清空場上比賽並暫停排賽
+            remoteState.currentMatch = null;
+            remoteState.upcomingMatch = null;
+            postAlert = `⚠️ 「${p.name}」已設為不在場，目前在場人數不足 4 人，已暫停本場比賽！`;
+            return remoteState;
+          }
+
+          // 從「在場且目前沒在場上打球」的球員中，挑一位最適合的候補（優先挑連休最久的，同分隨機）
+          const benchPlayers = remoteActive
+            .filter(x => !currentIds.includes(x.id))
+            .sort((a, b) => ((b.consecutiveRest || 0) - (a.consecutiveRest || 0)) || (Math.random() - 0.5));
+
+          const substitute = benchPlayers[0];
+          if (substitute) {
+            teamA = teamA.map(pid => (pid === id ? substitute.id : pid));
+            teamB = teamB.map(pid => (pid === id ? substitute.id : pid));
+            remoteState.currentMatch.teamA = teamA;
+            remoteState.currentMatch.teamB = teamB;
+          }
+        }
+
+        // 重新計算下一場預排陣容
         remoteState.upcomingMatch = generateUpcomingMatch(
           remoteState.currentMatch,
           remoteState.players,
           remoteState.history
         );
       }
+
       return remoteState;
+    }, () => {
+      if (postAlert) alert(postAlert);
     });
   };
 
