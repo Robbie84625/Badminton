@@ -1,7 +1,5 @@
 // src/utils/matchmaker.js
 
-const RECENT_MATCH_WINDOW = 2;
-
 function extractMatchPlayerIds(match) {
   if (!match) return [];
   const rawList = [
@@ -58,20 +56,20 @@ export function getPairHistoryCount(p1Id, p2Id, historyList) {
 }
 
 function getGroupOverlapCost(fourPlayers, historyList) {
-  const recentHistory = (historyList || []).slice(-RECENT_MATCH_WINDOW);
+  // 只看「上一場 (slice(-1))」，避免剛從休息/遲到回來的人因為前 2 場成本為 0 而連續被抓上場
+  const lastMatch = (historyList || []).slice(-1)[0];
+  if (!lastMatch) return 0;
+
+  const lastIds = extractMatchPlayerIds(lastMatch);
   let totalCost = 0;
 
   for (let i = 0; i < fourPlayers.length; i++) {
     for (let j = i + 1; j < fourPlayers.length; j++) {
       const id1 = fourPlayers[i].id;
       const id2 = fourPlayers[j].id;
-
-      for (const h of recentHistory) {
-        const allIds = extractMatchPlayerIds(h);
-        // 最近 2 場同場打球過，給予重罰，強迫拆散上一場一起打球的人！
-        if (allIds.includes(id1) && allIds.includes(id2)) {
-          totalCost += 5;
-        }
+      // 如果這兩個人「上一場」才剛一起打過球，這場盡量把他們拆開
+      if (lastIds.includes(id1) && lastIds.includes(id2)) {
+        totalCost += 3;
       }
     }
   }
