@@ -1,9 +1,51 @@
 // src/utils/matchmaker.js
 
-// 【選誰上場】只記憶最近 2 場，避開短期重複，且絕不讓遲到者因為整晚重疊度低而狂追場次
 const RECENT_MATCH_WINDOW = 2;
 
-// 【決定隊友】翻閱「整晚所有歷史紀錄」，確保每個人都能跟所有隊友 (C7取1) 輪流搭檔
+function extractMatchPlayerIds(match) {
+  if (!match) return [];
+  const rawList = [
+    ...(match.teamAIds || []),
+    ...(match.teamBIds || []),
+    ...(match.teamA || []),
+    ...(match.teamB || []),
+    ...(match.players || [])
+  ];
+  return rawList.map(p => (typeof p === 'object' && p !== null ? (p.id ?? p.name) : p));
+}
+
+function trueShuffle(array) {
+  const arr = [...array];
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+function syncRealConsecutiveStats(playerPool, matchHistory) {
+  const history = matchHistory || [];
+  return playerPool.map(p => {
+    const pid = p.id ?? p.name;
+    let realCPlay = 0;
+
+    for (let i = history.length - 1; i >= 0; i--) {
+      const ids = extractMatchPlayerIds(history[i]);
+      if (ids.includes(pid)) {
+        realCPlay++;
+      } else {
+        break;
+      }
+    }
+
+    return {
+      ...p,
+      consecutivePlay: realCPlay,
+      consecutiveRest: p._simulatedCRest !== undefined ? p._simulatedCRest : (p.consecutiveRest || 0)
+    };
+  });
+}
+
 export function getPairHistoryCount(p1Id, p2Id, historyList) {
   let count = 0;
   for (const h of (historyList || [])) {
@@ -15,29 +57,29 @@ export function getPairHistoryCount(p1Id, p2Id, historyList) {
   return count;
 }
 
-// 計算四個人裡面，任意兩人在「最近 2 場」中同場打球過幾次（含同隊與對手）
 function getGroupOverlapCost(fourPlayers, historyList) {
   const recentHistory = (historyList || []).slice(-RECENT_MATCH_WINDOW);
-  let totalOverlap = 0;
+  let totalCost = 0;
+
   for (let i = 0; i < fourPlayers.length; i++) {
     for (let j = i + 1; j < fourPlayers.length; j++) {
       const id1 = fourPlayers[i].id;
       const id2 = fourPlayers[j].id;
+
       for (const h of recentHistory) {
-        const allIds = [...(h.teamAIds || []), ...(h.teamBIds || [])];
+        const allIds = extractMatchPlayerIds(h);
+        // 最近 2 場同場打球過，給予重罰，強迫拆散上一場一起打球的人！
         if (allIds.includes(id1) && allIds.includes(id2)) {
-          totalOverlap++;
+          totalCost += 5;
         }
       }
     }
   }
-  return totalOverlap;
+  return totalCost;
 }
 
-// 決定這 4 個人要怎麼分成 A、B 兩隊：
-// 優先挑選「整晚最少當過隊友」的拆法；若次數相同則完全隨機（自動產生同隊與不同隊的變化）
 export function divideIntoBestTeams(fourPlayers, historyList) {
-  const [p1, p2, p3, p4] = fourPlayers;
+  const [p1, p2, p3, p4] = trueShuffle(fourPlayers);
   const configurations = [
     {
       teamA: [p1.id, p2.id],
@@ -56,14 +98,13 @@ export function divideIntoBestTeams(fourPlayers, historyList) {
     }
   ];
 
-  configurations.sort((a, b) => (a.cost - b.cost) || (Math.random() - 0.5));
+  configurations.sort((a, b) => a.cost - b.cost);
   return {
     teamA: configurations[0].teamA,
     teamB: configurations[0].teamB
   };
 }
 
-// 輔助函式：產生所有「N 取 k」的組合
 function getCombinations(arr, k) {
   if (k === 0) return [[]];
   if (arr.length < k) return [];
@@ -78,19 +119,20 @@ export function pickFourPlayers(playerPool, matchHistory) {
   if (N < 4) return null;
   if (N === 4) return divideIntoBestTeams(playerPool, matchHistory);
 
-  // 1. 【硬性規則：不連打超過 2 場】只有 5 人時物理上必須連打 4 場，6 人以上連打滿 2 場強制下場
+  const shuffledInput = trueShuffle(playerPool);
+  const syncedPool = syncRealConsecutiveStats(shuffledInput, matchHistory);
+
+  // 1. 【硬性規則：不連打超過 2 場】
   const maxConsecutivePlay = N === 5 ? 4 : 2;
-  const eligiblePlayers = playerPool.filter(p => (p.consecutivePlay || 0) < maxConsecutivePlay);
-  const candidatePool = eligiblePlayers.length >= 4 ? eligiblePlayers : playerPool;
+  const eligiblePlayers = syncedPool.filter(p => p.consecutivePlay < maxConsecutivePlay);
+  const candidatePool = eligiblePlayers.length >= 4 ? eligiblePlayers : syncedPool;
 
-  // 2. 【硬性規則：不連休超過 2 場】連休 >= 2 場的人直接保送進入必選名單
-  let mustPlay = candidatePool.filter(p => (p.consecutiveRest || 0) >= 2);
-  let remainingPool = candidatePool.filter(p => (p.consecutiveRest || 0) < 2);
+  // 2. 【硬性規則：不連休超過 2 場】
+  let mustPlay = candidatePool.filter(p => p.consecutiveRest >= 2);
+  let remainingPool = candidatePool.filter(p => p.consecutiveRest < 2);
 
-  // 若人數 >= 13 人導致超過 4 人連休 2 場，優先讓休最久的人上場
   if (mustPlay.length >= 4) {
-    mustPlay.sort((a, b) => (b.consecutiveRest || 0) - (a.consecutiveRest || 0) || (Math.random() - 0.5));
-    return divideIntoBestTeams(mustPlay.slice(0, 4), matchHistory);
+    return divideIntoBestTeams(trueShuffle(mustPlay).slice(0, 4), matchHistory);
   }
 
   // 3. 產生所有合法的 4 人組合
@@ -98,25 +140,24 @@ export function pickFourPlayers(playerPool, matchHistory) {
   const combs = getCombinations(remainingPool, needed);
   let possibleFourGroups = combs.map(c => [...mustPlay, ...c]);
 
-  // 4. 【打破 8 人 4上4下】人數剛好 8 人時，強制每場必須是「2個上一場打過 + 2個上一場沒打」
+  // 4. 【打破 8 人 4上4下 且 打破雙胞胎綁定】
+  // 只要不讓 4 個人「全部上一場都打過（4上）」或「全部上一場都沒打（4下）」即可！
+  // 允許「1上3下」、「2上2下」、「3上1下」，這樣雙胞胎才能被拆開（1人留下、1人下場）！
   if (N === 8) {
     const mixedGroups = possibleFourGroups.filter(group => {
-      const playedLastCount = group.filter(p => (p.consecutivePlay || 0) > 0).length;
-      return playedLastCount === 2;
+      const playedLastCount = group.filter(p => p.consecutivePlay > 0).length;
+      return playedLastCount >= 1 && playedLastCount <= 3;
     });
     if (mixedGroups.length > 0) {
       possibleFourGroups = mixedGroups;
     }
   }
 
-  // 5. 挑選「最近 2 場最少碰頭」的 4 人組合；重疊度相同時完全隨機
-  possibleFourGroups.sort((a, b) => {
-    const costA = getGroupOverlapCost(a, matchHistory);
-    const costB = getGroupOverlapCost(b, matchHistory);
-    return (costA - costB) || (Math.random() - 0.5);
-  });
+  // 5. 先洗牌再排序：重罰「最近 2 場同場打過球的人」，強迫上一場一起打的 7、8 號這場必須拆開！
+  const shuffledGroups = trueShuffle(possibleFourGroups);
+  shuffledGroups.sort((a, b) => getGroupOverlapCost(a, matchHistory) - getGroupOverlapCost(b, matchHistory));
 
-  const bestFour = possibleFourGroups[0];
+  const bestFour = shuffledGroups[0];
   return divideIntoBestTeams(bestFour, matchHistory);
 }
 
@@ -124,19 +165,23 @@ export function generateUpcomingMatch(currentMatchSelection, allPlayers, matchHi
   const activePlayers = (allPlayers || []).filter(p => p.status === 'active');
   if (activePlayers.length < 4) return null;
 
-  const currentIds = [...currentMatchSelection.teamA, ...currentMatchSelection.teamB];
-  const simulatedPlayers = activePlayers.map(p => {
-    const copy = { ...p };
-    if (currentIds.includes(copy.id)) {
-      copy.played = (copy.played || 0) + 1;
-      copy.consecutivePlay = (copy.consecutivePlay || 0) + 1;
-      copy.consecutiveRest = 0;
-    } else {
-      copy.consecutivePlay = 0;
-      copy.consecutiveRest = (copy.consecutiveRest || 0) + 1;
-    }
-    return copy;
-  });
+  const rawCurrent = [
+    ...(currentMatchSelection?.teamA || []),
+    ...(currentMatchSelection?.teamB || []),
+    ...(currentMatchSelection?.teamAIds || []),
+    ...(currentMatchSelection?.teamBIds || [])
+  ];
+  const currentIds = rawCurrent.map(p => (typeof p === 'object' && p !== null ? (p.id ?? p.name) : p));
 
-  return pickFourPlayers(simulatedPlayers, matchHistory);
+  const simulatedPlayers = activePlayers.map(p => ({
+    ...p,
+    _simulatedCRest: currentIds.includes(p.id) ? 0 : (p.consecutiveRest || 0) + 1
+  }));
+
+  const simulatedHistory = [
+    ...(matchHistory || []),
+    { teamAIds: currentIds.slice(0, 2), teamBIds: currentIds.slice(2, 4) }
+  ];
+
+  return pickFourPlayers(simulatedPlayers, simulatedHistory);
 }

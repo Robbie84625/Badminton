@@ -92,6 +92,9 @@ function App() {
       const p = remoteState.players.find(x => x.id === id);
       if (!p) return null;
       p.status = newStatus;
+      if (newStatus === 'active') {
+        p.consecutiveRest = 0;
+      }
       if (remoteState.currentMatch) {
         remoteState.upcomingMatch = generateUpcomingMatch(
           remoteState.currentMatch,
@@ -498,6 +501,31 @@ function App() {
                 ) : (
                   players.map((p) => {
                     const isActive = p.status === 'active';
+
+                    let realPlayed = 0;
+                    let realCPlay = 0;
+                    let realCRest = 0;
+
+                    for (const h of sortedHistory) {
+                      const ids = [...(h.teamAIds || []), ...(h.teamBIds || [])];
+                      if (ids.includes(p.id)) realPlayed++;
+                    }
+
+                    for (let i = sortedHistory.length - 1; i >= 0; i--) {
+                      const ids = [...(sortedHistory[i].teamAIds || []), ...(sortedHistory[i].teamBIds || [])];
+                      if (ids.includes(p.id)) realCPlay++;
+                      else break;
+                    }
+
+                    if (isActive && realCPlay === 0) {
+                      for (let i = sortedHistory.length - 1; i >= 0; i--) {
+                        const ids = [...(sortedHistory[i].teamAIds || []), ...(sortedHistory[i].teamBIds || [])];
+                        if (!ids.includes(p.id)) realCRest++;
+                        else break;
+                      }
+                      realCRest = Math.min(realCRest, p.consecutiveRest ?? realCRest);
+                    }
+
                     return (
                       <tr key={p.id} className="hover:bg-gray-50 transition">
                         <td className="py-2">
@@ -512,20 +540,20 @@ function App() {
                             className="w-full max-w-[150px] font-bold text-gray-800 px-2 py-1 rounded-md border border-transparent hover:border-gray-300 focus:border-green-500 focus:bg-white focus:outline-none transition bg-transparent"
                           />
                         </td>
-                        <td className="py-2 text-center font-bold text-green-600">{p.played || 0}</td>
+                        <td className="py-2 text-center font-bold text-green-600">{realPlayed}</td>
                         <td className="py-2 text-center">
-                          {(p.consecutivePlay || 0) > 0 ? (
+                          {realCPlay > 0 ? (
                             <span className="bg-amber-100 text-amber-800 font-bold px-2 py-0.5 rounded-full text-xs">
-                              {p.consecutivePlay}
+                              {realCPlay}
                             </span>
                           ) : (
                             <span className="text-gray-300">0</span>
                           )}
                         </td>
                         <td className="py-2 text-center">
-                          {(p.consecutiveRest || 0) > 0 ? (
+                          {realCRest > 0 ? (
                             <span className="bg-blue-100 text-blue-800 font-bold px-2 py-0.5 rounded-full text-xs">
-                              {p.consecutiveRest}
+                              {realCRest}
                             </span>
                           ) : (
                             <span className="text-gray-300">0</span>
